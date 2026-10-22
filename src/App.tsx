@@ -1,4 +1,5 @@
-import { useMemo, useState, type ChangeEvent, type FormEvent } from 'react'
+import { useEffect, useMemo, useState, type ChangeEvent, type FormEvent } from 'react'
+import type { Session } from '@supabase/supabase-js'
 import {
   ArrowDownRight,
   ArrowRight,
@@ -6,6 +7,8 @@ import {
   Check,
   ChevronDown,
   Clock3,
+  LogIn,
+  LogOut,
   Menu,
   MessageCircle,
   Plus,
@@ -14,12 +17,15 @@ import {
   Share2,
   Send,
   Sparkles,
+  Trash2,
   X,
 } from 'lucide-react'
+import { allowedDomain, supabase } from './supabase'
 
-type Comment = { id: string; name: string; text: string; date: string }
+type Comment = { id: string; userId: string; name: string; text: string; date: string }
 type Post = {
   id: string
+  userId: string
   title: string
   excerpt: string
   content: string
@@ -33,24 +39,48 @@ type Post = {
 }
 
 const starterCategories = ['Amenazas informáticas', 'Vulnerabilidades', 'Estrategias de protección', 'Prevención y respuesta']
-const legacySampleIds = new Set(['aprender-preguntas', 'notas-campo', 'tecnologia-pausa'])
 const blogroll = [
   { name: 'INTEF · Recursos educativos', url: 'https://intef.es/' },
   { name: 'UNESCO · Educación', url: 'https://www.unesco.org/en/education' },
   { name: 'OCDE · Educación', url: 'https://www.oecd.org/education/' },
   { name: 'Universidad Politécnica de Madrid', url: 'https://www.upm.es/' },
 ]
-const storageKey = 'cuaderno-blog-posts-v1'
+const BUCKET = 'evidencias'
+const allowedImageTypes = ['image/jpeg', 'image/png', 'image/webp']
 
-function readPosts(): Post[] {
-  try {
-    const saved = localStorage.getItem(storageKey)
-    if (!saved) return []
-    const storedPosts: unknown = JSON.parse(saved)
-    return Array.isArray(storedPosts) ? (storedPosts as Post[]).filter((post) => !legacySampleIds.has(post.id)) : []
-  } catch {
-    return []
+type CommentRow = { id: string; user_id: string; nombre: string; contenido: string; created_at: string }
+type PostRow = {
+  id: string; user_id: string; titulo: string; extracto: string; contenido: string; autor: string
+  categoria: string; etiquetas: string[] | null; portada_url: string | null; created_at: string
+  comments: CommentRow[] | null
+}
+
+function toPost(row: PostRow): Post {
+  const comments = [...(row.comments ?? [])]
+    .sort((first, second) => first.created_at.localeCompare(second.created_at))
+    .map((comment) => ({ id: comment.id, userId: comment.user_id, name: comment.nombre, text: comment.contenido, date: comment.created_at.slice(0, 10) }))
+  return {
+    id: row.id, userId: row.user_id, title: row.titulo, excerpt: row.extracto, content: row.contenido, author: row.autor,
+    category: row.categoria, tags: row.etiquetas ?? [], date: row.created_at.slice(0, 10),
+    readTime: `${Math.max(1, Math.ceil(row.contenido.split(/\s+/).length / 180))} min de lectura`,
+    image: row.portada_url ?? '', comments,
   }
+}
+
+function authMessage(message: string) {
+  if (/invalid login credentials/i.test(message)) return 'Correo o contraseña incorrectos.'
+  if (/already registered/i.test(message)) return 'Ese correo ya tiene una cuenta. Inicia sesión.'
+  if (/password should be at least/i.test(message)) return 'La contraseña debe tener al menos 6 caracteres.'
+  if (/rate limit/i.test(message)) return 'Demasiados intentos. Espera unos minutos.'
+  if (/database error/i.test(message)) return 'Este correo no está autorizado para registrarse.'
+  return 'No se pudo completar la acción. Inténtalo de nuevo.'
+}
+
+async function removeImage(url: string) {
+  const marker = `/${BUCKET}/`
+  const index = url.indexOf(marker)
+  if (index === -1) return
+  await supabase.storage.from(BUCKET).remove([decodeURIComponent(url.slice(index + marker.length))])
 }
 
 function formatDate(date: string) {
@@ -58,18 +88,24 @@ function formatDate(date: string) {
 }
 
 function App() {
-  const [posts, setPosts] = useState<Post[]>(readPosts)
-  const [activePage, setActivePage] = useState<'inicio' | 'archivo' | 'acerca' | 'admin'>('inicio')
+  const [posts, setPosts] = useState<Post[]>([])
+  const [activePage, setActivePage] = useState<'inicio' | 'archivo' | 'acerca' | 'admin' | 'acceso'>('inicio')
   const [selectedCategory, setSelectedCategory] = useState('Todas')
   const [selectedTag, setSelectedTag] = useState('')
   const [query, setQuery] = useState('')
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
   const [selectedPostId, setSelectedPostId] = useState<string | null>(() => window.location.hash.replace(/^#post-/, '') || null)
   const [editingPostId, setEditingPostId] = useState<string | null>(null)
-  const [commentName, setCommentName] = useState('')
   const [commentText, setCommentText] = useState('')
   const [notice, setNotice] = useState('')
   const [imagePreview, setImagePreview] = useState('')
+  const [imageFile, setImageFile] = useState<File | null>(null)
+  const [session, setSession] = useState<Session | null>(null)
+  const [loadingPosts, setLoadingPosts] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [authMode, setAuthMode] = useState<'entrar' | 'registro'>('entrar')
+  const [authBusy, setAuthBusy] = useState(false)
+  const displayName = String(session?.user.user_metadata?.nombre ?? session?.user.email?.split('@')[0] ?? '')
 
   const categories = useMemo(() => [...new Set([...starterCategories, ...posts.map((post) => post.category)])], [posts])
   const tags = useMemo(() => [...new Set(posts.flatMap((post) => post.tags))], [posts])
@@ -80,12 +116,27 @@ function App() {
     .filter((post) => `${post.title} ${post.excerpt} ${post.content} ${post.author} ${post.tags.join(' ')}`.toLowerCase().includes(query.toLowerCase()))
     .sort((first, second) => second.date.localeCompare(first.date)), [posts, query, selectedCategory, selectedTag])
 
-  function savePosts(nextPosts: Post[]) {
-    setPosts(nextPosts)
-    localStorage.setItem(storageKey, JSON.stringify(nextPosts))
+  function flash(message: string) {
+    setNotice(message)
+    window.setTimeout(() => setNotice(''), 3600)
   }
 
-  function goTo(page: typeof activePage) {
+  async function loadPosts() {
+    const { data, error } = await supabase.from('posts').select('*, comments(*)').order('created_at', { ascending: false })
+    if (error) flash('No se pudieron cargar las publicaciones.')
+    else setPosts(((data ?? []) as PostRow[]).map(toPost))
+    setLoadingPosts(false)
+  }
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => setSession(data.session))
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, next) => setSession(next))
+    loadPosts()
+    return () => listener.subscription.unsubscribe()
+  }, [])
+
+  function goTo(requested: typeof activePage) {
+    const page = requested === 'admin' && !session ? 'acceso' : requested
     setActivePage(page)
     setMobileMenuOpen(false)
     setSelectedPostId(null)
@@ -143,22 +194,27 @@ function App() {
     setActivePage('archivo')
   }
 
-  function submitComment(event: FormEvent<HTMLFormElement>) {
+  async function submitComment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!selectedPost || !commentName.trim() || !commentText.trim()) return
-    const comment: Comment = { id: crypto.randomUUID(), name: commentName.trim(), text: commentText.trim(), date: 'ahora' }
-    savePosts(posts.map((post) => post.id === selectedPost.id ? { ...post, comments: [...post.comments, comment] } : post))
-    setCommentName('')
+    if (!selectedPost || !session || !commentText.trim()) return
+    const { error } = await supabase.from('comments').insert({ post_id: selectedPost.id, nombre: displayName, contenido: commentText.trim() })
+    if (error) return flash('No se pudo publicar el comentario.')
     setCommentText('')
-    setNotice('Tu comentario ya está publicado.')
-    window.setTimeout(() => setNotice(''), 3200)
+    await loadPosts()
+    flash('Tu comentario ya está publicado.')
+  }
+
+  async function deleteComment(commentId: string) {
+    const { error } = await supabase.from('comments').delete().eq('id', commentId)
+    if (error) return flash('No se pudo eliminar el comentario.')
+    await loadPosts()
   }
 
   function handleImage(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0]
     if (!file) return
-    if (!file.type.startsWith('image/')) {
-      setNotice('Selecciona un archivo de imagen válido.')
+    if (!allowedImageTypes.includes(file.type)) {
+      setNotice('Usa una imagen JPG, PNG o WEBP.')
       return
     }
     if (file.size > 4 * 1024 * 1024) {
@@ -166,42 +222,109 @@ function App() {
       return
     }
     const reader = new FileReader()
+    setImageFile(file)
     reader.onload = () => setImagePreview(String(reader.result))
     reader.readAsDataURL(file)
   }
 
-  function submitPost(event: FormEvent<HTMLFormElement>) {
+  async function submitPost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    const formData = new FormData(event.currentTarget)
+    if (!session || saving) return
+    const form = event.currentTarget
+    const formData = new FormData(form)
     const title = String(formData.get('title') ?? '').trim()
     const excerpt = String(formData.get('excerpt') ?? '').trim()
     const content = String(formData.get('content') ?? '').trim()
     const author = String(formData.get('author') ?? '').trim()
-    const category = String(formData.get('category') ?? 'Pedagogía')
+    const category = String(formData.get('category') ?? starterCategories[0])
     const postTags = String(formData.get('tags') ?? '').split(',').map((tag) => tag.trim()).filter(Boolean)
     if (!title || !excerpt || !content || !author) return
     const existing = posts.find((post) => post.id === editingPostId)
-    const post: Post = {
-      id: editingPostId ?? crypto.randomUUID(), title, excerpt, content, author, category, tags: postTags,
-      date: existing?.date ?? new Date().toISOString().slice(0, 10),
-      readTime: `${Math.max(1, Math.ceil(content.split(/\s+/).length / 180))} min de lectura`,
-      image: imagePreview || existing?.image || '', comments: existing?.comments ?? [],
+    setSaving(true)
+    try {
+      let coverUrl: string | null = imagePreview ? existing?.image || null : null
+      if (imageFile) {
+        const extension = imageFile.type === 'image/png' ? 'png' : imageFile.type === 'image/webp' ? 'webp' : 'jpg'
+        const path = `${session.user.id}/${crypto.randomUUID()}.${extension}`
+        const { error: uploadError } = await supabase.storage.from(BUCKET).upload(path, imageFile, { contentType: imageFile.type })
+        if (uploadError) throw uploadError
+        coverUrl = supabase.storage.from(BUCKET).getPublicUrl(path).data.publicUrl
+      }
+      const payload = { titulo: title, extracto: excerpt, contenido: content, autor: author, categoria: category, etiquetas: postTags, portada_url: coverUrl }
+      const { error } = editingPostId
+        ? await supabase.from('posts').update(payload).eq('id', editingPostId)
+        : await supabase.from('posts').insert(payload)
+      if (error) throw error
+      if (existing?.image && existing.image !== coverUrl) await removeImage(existing.image)
+      await loadPosts()
+      form.reset()
+      setImagePreview('')
+      setImageFile(null)
+      flash(editingPostId ? 'La publicación se ha actualizado.' : 'La publicación ya está en el blog.')
+      setEditingPostId(null)
+    } catch {
+      flash('No se pudo guardar. Revisa tu conexión e inténtalo de nuevo.')
+    } finally {
+      setSaving(false)
     }
-    savePosts(editingPostId ? posts.map((item) => item.id === post.id ? post : item) : [post, ...posts])
-    setEditingPostId(null)
-    setImagePreview('')
-    event.currentTarget.reset()
-    setNotice(editingPostId ? 'La publicación se ha actualizado.' : 'La publicación ya está en el blog.')
-    window.setTimeout(() => setNotice(''), 3200)
   }
 
   function startEditing(post: Post) {
     setEditingPostId(post.id)
     setImagePreview(post.image)
+    setImageFile(null)
     window.scrollTo({ top: 0, behavior: 'smooth' })
   }
 
+  async function deletePost(post: Post) {
+    if (!window.confirm(`¿Eliminar "${post.title}"? Esta acción no se puede deshacer.`)) return
+    const { error } = await supabase.from('posts').delete().eq('id', post.id)
+    if (error) return flash('No se pudo eliminar la publicación.')
+    if (post.image) await removeImage(post.image)
+    if (editingPostId === post.id) { setEditingPostId(null); setImagePreview(''); setImageFile(null) }
+    await loadPosts()
+    flash('Publicación eliminada.')
+  }
+
+  async function submitAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (authBusy) return
+    const formData = new FormData(event.currentTarget)
+    const email = String(formData.get('email') ?? '').trim().toLowerCase()
+    const password = String(formData.get('password') ?? '')
+    const nombre = String(formData.get('nombre') ?? '').trim()
+    if (allowedDomain && !email.endsWith(`@${allowedDomain}`)) return flash(`Usa tu correo institucional (@${allowedDomain}).`)
+    setAuthBusy(true)
+    try {
+      if (authMode === 'registro') {
+        const { data, error } = await supabase.auth.signUp({ email, password, options: { data: { nombre } } })
+        if (error) throw error
+        if (!data.session) { flash('Cuenta creada. Revisa tu correo para confirmarla.'); return }
+        flash('Cuenta creada. ¡Bienvenido!')
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password })
+        if (error) throw error
+        flash('Sesión iniciada.')
+      }
+      goTo('inicio')
+    } catch (error) {
+      flash(authMessage(error instanceof Error ? error.message : ''))
+    } finally {
+      setAuthBusy(false)
+    }
+  }
+
+  async function signOut() {
+    await supabase.auth.signOut()
+    setEditingPostId(null)
+    setImagePreview('')
+    setImageFile(null)
+    goTo('inicio')
+    flash('Sesión cerrada.')
+  }
+
   const editingPost = posts.find((post) => post.id === editingPostId)
+  const myPosts = posts.filter((post) => post.userId === session?.user.id)
 
   return (
     <div className="site-shell">
@@ -220,6 +343,9 @@ function App() {
             </button>
           ))}
           <button className="nav-admin" onClick={() => goTo('admin')}><Plus size={15} /> Publicar</button>
+          {session
+            ? <button className="nav-link" onClick={signOut}><LogOut size={15} /> Salir</button>
+            : <button className={activePage === 'acceso' ? 'nav-link active' : 'nav-link'} onClick={() => goTo('acceso')}><LogIn size={15} /> Entrar</button>}
         </nav>
       </header>
 
@@ -250,7 +376,18 @@ function App() {
           <div className="about-values"><div><span>01</span><h3>Amenazas</h3><p>Malware, phishing y accesos no autorizados.</p></div><div><span>02</span><h3>Protección</h3><p>Controles, autenticación y copias de seguridad.</p></div><div><span>03</span><h3>Resiliencia</h3><p>Prevención, detección, respuesta y recuperación.</p></div></div>
         </section>}
 
-        {activePage === 'admin' && <section className="admin-page">
+        {activePage === 'acceso' && <section className="admin-page">
+          <div className="section-heading admin-heading"><div><span className="eyebrow"><span className="eyebrow-line" /> ACCESO</span><h1>{authMode === 'entrar' ? 'Iniciar sesión' : 'Crear cuenta'}</h1><p>{allowedDomain ? `Usa tu correo institucional (@${allowedDomain}).` : 'Usa tu correo institucional.'} Crea una contraseña propia para este blog; no uses la de la universidad.</p></div></div>
+          <form className="comment-form" style={{ maxWidth: 440 }} onSubmit={submitAuth}>
+            {authMode === 'registro' && <label>Nombre completo<input name="nombre" required placeholder="Tu nombre y apellido" autoComplete="name" /></label>}
+            <label>Correo institucional<input name="email" type="email" required placeholder={allowedDomain ? `usuario@${allowedDomain}` : 'usuario@universidad.edu'} autoComplete="email" /></label>
+            <label>Contraseña<input name="password" type="password" required minLength={8} placeholder="Mínimo 8 caracteres" autoComplete={authMode === 'entrar' ? 'current-password' : 'new-password'} /></label>
+            <button className="button-primary" type="submit" disabled={authBusy}><LogIn size={15} /> {authBusy ? 'Un momento…' : authMode === 'entrar' ? 'Entrar' : 'Crear cuenta'}</button>
+            <button className="button-quiet" type="button" onClick={() => setAuthMode(authMode === 'entrar' ? 'registro' : 'entrar')}>{authMode === 'entrar' ? '¿No tienes cuenta? Regístrate' : '¿Ya tienes cuenta? Inicia sesión'}</button>
+          </form>
+        </section>}
+
+        {activePage === 'admin' && session && <section className="admin-page">
           <div className="section-heading admin-heading"><div><span className="eyebrow"><span className="eyebrow-line" /> ESPACIO DE EDICIÓN</span><h1>{editingPost ? 'Editar publicación' : 'Nueva publicación'}</h1><p>Escribe una idea, añade una imagen y compártela con la comunidad.</p></div><span className="admin-stamp"><Sparkles size={15} /> EDITOR</span></div>
           <form className="editor-form" onSubmit={submitPost}>
             <div className="editor-main">
@@ -259,20 +396,20 @@ function App() {
               <label className="field-label">Contenido<textarea key={`content-${editingPostId ?? 'new'}`} name="content" required rows={11} defaultValue={editingPost?.content ?? ''} placeholder="Desarrolla el tema de investigación. Separa los párrafos con una línea en blanco." /></label>
             </div>
             <aside className="editor-side">
-              <label className="field-label">Autor<input key={`author-${editingPostId ?? 'new'}`} name="author" required defaultValue={editingPost?.author ?? ''} placeholder="Tu nombre" /></label>
+              <label className="field-label">Autor<input key={`author-${editingPostId ?? 'new'}`} name="author" required defaultValue={editingPost?.author ?? displayName} placeholder="Tu nombre" /></label>
               <label className="field-label">Categoría<span className="select-wrap"><select key={`category-${editingPostId ?? 'new'}`} name="category" defaultValue={editingPost?.category ?? starterCategories[0]}>{categories.map((category) => <option key={category}>{category}</option>)}</select><ChevronDown size={16} /></span></label>
               <label className="field-label">Etiquetas <small>separadas por coma</small><input key={`tags-${editingPostId ?? 'new'}`} name="tags" defaultValue={editingPost?.tags.join(', ') ?? ''} placeholder="phishing, malware, prevención" /></label>
               <div className="field-label">Imagen de portada
                 <label className={`image-drop ${imagePreview ? 'has-image' : ''}`}>
                   {imagePreview ? <img src={imagePreview} alt="Vista previa de portada" /> : <><span className="upload-icon"><Plus size={18} /></span><span>Añadir imagen</span><small>JPG, PNG o WEBP · máx. 4 MB</small></>}
-                  <input type="file" accept="image/*" onChange={handleImage} aria-label="Subir imagen de portada" />
+                  <input type="file" accept="image/jpeg,image/png,image/webp" onChange={handleImage} aria-label="Subir imagen de portada" />
                 </label>
-                {imagePreview && <button type="button" className="remove-image" onClick={() => setImagePreview('')}>Quitar imagen</button>}
+                {imagePreview && <button type="button" className="remove-image" onClick={() => { setImagePreview(''); setImageFile(null) }}>Quitar imagen</button>}
               </div>
-              <div className="editor-actions"><button type="submit" className="button-primary"><Check size={16} /> {editingPost ? 'Guardar cambios' : 'Publicar entrada'}</button>{editingPost && <button type="button" className="button-quiet" onClick={() => { setEditingPostId(null); setImagePreview('') }}>Cancelar</button>}</div>
+              <div className="editor-actions"><button type="submit" className="button-primary" disabled={saving}><Check size={16} /> {saving ? 'Guardando…' : editingPost ? 'Guardar cambios' : 'Publicar entrada'}</button>{editingPost && <button type="button" className="button-quiet" onClick={() => { setEditingPostId(null); setImagePreview(''); setImageFile(null) }}>Cancelar</button>}</div>
             </aside>
           </form>
-          <div className="manage-posts"><div className="manage-heading"><h2>Tus publicaciones</h2><span>{posts.length} entradas</span></div>{posts.map((post) => <div className="manage-row" key={post.id}><div><span>{post.category} · {formatDate(post.date)}</span><strong>{post.title}</strong></div><button onClick={() => startEditing(post)}>Editar</button></div>)}</div>
+          <div className="manage-posts"><div className="manage-heading"><h2>Tus publicaciones</h2><span>{myPosts.length} entradas</span></div>{myPosts.map((post) => <div className="manage-row" key={post.id}><div><span>{post.category} · {formatDate(post.date)}</span><strong>{post.title}</strong></div><div style={{ display: 'flex', gap: 8 }}><button onClick={() => startEditing(post)}>Editar</button><button onClick={() => deletePost(post)}>Eliminar</button></div></div>)}</div>
         </section>}
 
         {(activePage === 'inicio' || activePage === 'archivo') && !selectedPost && <div className="content-layout">
@@ -283,7 +420,7 @@ function App() {
             {visiblePosts.length > 0 ? <div className="post-list">{visiblePosts.map((post, index) => <article className={`post-card ${index === 0 && activePage === 'inicio' ? 'featured-post' : ''}`} key={post.id}>
               <button className={`post-image ${post.image ? '' : 'image-placeholder'}`} onClick={() => openPost(post.id)} aria-label={`Leer ${post.title}`} style={post.image ? { backgroundImage: `url("${post.image}")` } : undefined}><span className="image-index">{String(index + 1).padStart(2, '0')}</span><span className="image-open"><ArrowRight size={19} /></span></button>
               <div className="post-details"><div className="post-meta"><button onClick={() => selectCategory(post.category)}>{post.category}</button><span>·</span><time dateTime={post.date}>{formatDate(post.date)}</time></div><button className="post-title-button" onClick={() => openPost(post.id)}><h3>{post.title}</h3></button><p className="post-excerpt">{post.excerpt}</p><div className="post-footer"><span className="author-name"><span className="author-avatar">{post.author.split(' ').map((word) => word[0]).slice(0, 2).join('')}</span> {post.author}</span><span className="read-time"><Clock3 size={13} /> {post.readTime}</span><button className="comment-count" onClick={() => openPost(post.id)} aria-label={`${post.comments.length} comentarios`}><MessageCircle size={14} /> {post.comments.length}</button></div><div className="post-tags">{post.tags.map((tag) => <button key={tag} onClick={() => selectTag(tag)}>#{tag}</button>)}</div></div>
-            </article>)}</div> : posts.length === 0 ? <div className="empty-state"><BookOpen size={22} /><h3>Aún no hay publicaciones</h3><p>Este espacio está preparado para sus análisis sobre ciberseguridad. Publiquen la primera entrada cuando quieran.</p><button onClick={() => goTo('admin')}>Crear primera publicación</button></div> : <div className="empty-state"><Search size={22} /><h3>No encontramos publicaciones</h3><p>Prueba con otra búsqueda o cambia los filtros.</p><button onClick={() => { setQuery(''); setSelectedCategory('Todas'); setSelectedTag('') }}>Limpiar filtros</button></div>}
+            </article>)}</div> : loadingPosts ? <div className="empty-state"><BookOpen size={22} /><h3>Cargando publicaciones…</h3></div> : posts.length === 0 ? <div className="empty-state"><BookOpen size={22} /><h3>Aún no hay publicaciones</h3><p>Este espacio está preparado para sus análisis sobre ciberseguridad. Publiquen la primera entrada cuando quieran.</p><button onClick={() => goTo('admin')}>Crear primera publicación</button></div> : <div className="empty-state"><Search size={22} /><h3>No encontramos publicaciones</h3><p>Prueba con otra búsqueda o cambia los filtros.</p><button onClick={() => { setQuery(''); setSelectedCategory('Todas'); setSelectedTag('') }}>Limpiar filtros</button></div>}
             {posts.length > 0 && <button className="load-more" onClick={() => goTo('archivo')}>Ver el archivo completo <ArrowRight size={16} /></button>}
           </section>
 
@@ -302,8 +439,10 @@ function App() {
           {selectedPost.image && <img className="article-cover" src={selectedPost.image} alt={`Imagen para ${selectedPost.title}`} />}
           <div className="article-body">{selectedPost.content.split('\n\n').map((paragraph, index) => <p key={index}>{paragraph}</p>)}<div className="article-tags">{selectedPost.tags.map((tag) => <button key={tag} onClick={() => { setSelectedPostId(null); selectTag(tag) }}>#{tag}</button>)}</div></div>
           <section className="comments-section"><div className="comments-title"><div><span className="eyebrow"><span className="eyebrow-line" /> CONVERSACIÓN</span><h2>Comentarios <span>{selectedPost.comments.length.toString().padStart(2, '0')}</span></h2></div><MessageCircle size={22} strokeWidth={1.4} /></div>
-            {selectedPost.comments.length ? <div className="comment-list">{selectedPost.comments.map((comment) => <div className="comment" key={comment.id}><span className="comment-avatar">{comment.name.split(' ').map((word) => word[0]).slice(0, 2).join('')}</span><div><div className="comment-meta"><strong>{comment.name}</strong><span>{comment.date}</span></div><p>{comment.text}</p></div></div>)}</div> : <p className="no-comments">Todavía no hay comentarios. Puedes abrir la conversación.</p>}
-            <form className="comment-form" onSubmit={submitComment}><label>Tu nombre<input value={commentName} onChange={(event) => setCommentName(event.target.value)} placeholder="¿Cómo te llamas?" required /></label><label>Tu comentario<textarea value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="Comparte una idea o pregunta…" rows={3} required /></label><button className="button-primary" type="submit"><Send size={15} /> Publicar comentario</button></form>
+            {selectedPost.comments.length ? <div className="comment-list">{selectedPost.comments.map((comment) => <div className="comment" key={comment.id}><span className="comment-avatar">{comment.name.split(' ').map((word) => word[0]).slice(0, 2).join('')}</span><div><div className="comment-meta"><strong>{comment.name}</strong><span>{formatDate(comment.date)}</span>{comment.userId === session?.user.id && <button className="remove-image" onClick={() => deleteComment(comment.id)} aria-label="Eliminar comentario"><Trash2 size={13} /></button>}</div><p>{comment.text}</p></div></div>)}</div> : <p className="no-comments">Todavía no hay comentarios. Puedes abrir la conversación.</p>}
+            {session
+              ? <form className="comment-form" onSubmit={submitComment}><label>Tu comentario<textarea value={commentText} onChange={(event) => setCommentText(event.target.value)} placeholder="Comparte una idea o pregunta…" rows={3} maxLength={1000} required /></label><button className="button-primary" type="submit"><Send size={15} /> Publicar comentario</button></form>
+              : <div className="comment-form"><p className="no-comments">Inicia sesión con tu correo institucional para comentar.</p><button className="button-primary" type="button" onClick={() => goTo('acceso')}><LogIn size={15} /> Iniciar sesión</button></div>}
           </section>
         </article>}
       </main>
